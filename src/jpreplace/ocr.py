@@ -40,9 +40,22 @@ def _session(path: Path, use_gpu: bool) -> ort.InferenceSession:
     opts.log_severity_level = 3
     providers: list = ["CPUExecutionProvider"]
     if use_gpu and "CUDAExecutionProvider" in ort.get_available_providers():
-        # HEURISTIC avoids a slow exhaustive cuDNN search on every new input shape.
-        providers.insert(0, ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}))
+        options = {
+            # HEURISTIC avoids a slow exhaustive cuDNN search on every new input shape.
+            "cudnn_conv_algo_search": "HEURISTIC",
+            # Do not grab memory in ever-doubling chunks; the LLM needs the VRAM.
+            "arena_extend_strategy": "kSameAsRequested",
+        }
+        providers.insert(0, ("CUDAExecutionProvider", options))
     return ort.InferenceSession(str(path), sess_options=opts, providers=providers)
+
+
+def _run_options() -> ort.RunOptions:
+    """Give memory back to the GPU after each call instead of keeping the
+    high-water mark of the largest image ever processed."""
+    options = ort.RunOptions()
+    options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
+    return options
 
 
 def _argmax_model(path: Path) -> Path:
@@ -140,6 +153,7 @@ class OCR:
         self.det_in = self.det.get_inputs()[0].name
         self.rec_in = self.rec.get_inputs()[0].name
         self.providers = self.det.get_providers()
+        self._run = _run_options() if "CUDAExecutionProvider" in self.providers else None
 
     # -- detection ---------------------------------------------------------
 
@@ -151,7 +165,7 @@ class OCR:
         img = cv2.resize(bgr, (rw, rh)) if (rh, rw) != (h, w) else bgr
         x = (img.astype(np.float32) - _DET_MEAN) / _DET_STD
         x = np.ascontiguousarray(x.transpose(2, 0, 1)[None])
-        prob = self.det.run(None, {self.det_in: x})[0][0, 0]
+        prob = self.det.run(None, {self.det_in: x}, run_options=self._run)[0][0, 0]
 
         mask = (prob > self.thresh).astype(np.uint8)
         contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -254,7 +268,7 @@ class OCR:
             for row, i in enumerate(idx):
                 img = cv2.resize(crops[i], (widths[i], _REC_HEIGHT), interpolation=cv2.INTER_LINEAR)
                 batch[row, :, :, : widths[i]] = (img.astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)
-            ids, conf = self.rec.run(None, {self.rec_in: batch})
+            ids, conf = self.rec.run(None, {self.rec_in: batch}, run_options=self._run)
             for row, i in enumerate(idx):
                 results[i] = self._ctc_decode(ids[row], conf[row])
         return results
@@ -264,7 +278,11 @@ class OCR:
         itself per shape on first use, which would otherwise delay the first
         translations by up to a second."""
         for width in range(_REC_WIDTH_STEP, max_width + 1, _REC_WIDTH_STEP):
-            self.rec.run(None, {self.rec_in: np.zeros((self.rec_batch, 3, _REC_HEIGHT, width), np.float32)})
+            self.rec.run(
+                None,
+                {self.rec_in: np.zeros((self.rec_batch, 3, _REC_HEIGHT, width), np.float32)},
+                run_options=self._run,
+            )
 
     def warm_up_detector(self, height: int, width: int) -> None:
         """Same, for the detector at a given capture size."""

@@ -17,7 +17,8 @@ from pathlib import Path
 import httpx
 
 _STOP = ["<|plamo:tag|>", "<|plamo:bos|>"]
-_CTX_PER_SLOT = 2048
+_CTX_PER_SLOT = 768  # the KV cache is shared, so this is an average, not a cap
+_MAX_UNIT_CHARS = 160  # hard upper bound on one request
 _CHUNK_CHARS = 70  # long blocks are split into sentence groups of about this size
 _LABEL_CHARS = 90  # units shorter than this get surrounding text as context
 _CONTEXT_BUDGET = 1500  # total context characters per screen; context costs time
@@ -57,6 +58,7 @@ class LlamaServer:
             # One shared KV cache: with per-slot caches llama.cpp cannot batch
             # requests of different lengths together, which halves throughput.
             "--kv-unified",
+            "--cache-ram", "0",  # no host-RAM prompt cache; every prompt is new
             "--no-webui",
         ]
         log = open(self.log_path, "w", encoding="utf-8", errors="replace")
@@ -117,10 +119,18 @@ def split_sentences(text: str, limit: int = _CHUNK_CHARS) -> list[str]:
     than one long one."""
     if len(text) <= limit * 1.3:
         return [text]
-    chunks: list[str] = []
+    sentences: list[str] = []
     for sentence in _SENTENCE_END.split(text):
-        if not sentence:
-            continue
+        # A "sentence" far beyond the limit (no full stops at all) is cut at
+        # commas, or anywhere as a last resort, to bound time and memory.
+        while len(sentence) > _MAX_UNIT_CHARS:
+            cut = sentence.rfind("、", limit // 2, _MAX_UNIT_CHARS) + 1 or _MAX_UNIT_CHARS
+            sentences.append(sentence[:cut])
+            sentence = sentence[cut:]
+        if sentence:
+            sentences.append(sentence)
+    chunks: list[str] = []
+    for sentence in sentences:
         if chunks and len(chunks[-1]) + len(sentence) <= limit:
             chunks[-1] += sentence
         else:
@@ -185,18 +195,22 @@ class Translator:
         return None if None in parts else " ".join(parts)
 
     def _request(self, backend: Backend, unit: _Unit) -> None:
-        r = self.client.post(
-            f"{backend.url}/completion",
-            json={
-                "prompt": build_prompt(unit.text, unit.context),
-                "n_predict": min(768, 48 + len(unit.text) * 3),
-                "temperature": 0,
-                "stop": _STOP,
-                "cache_prompt": False,
-            },
-        )
-        r.raise_for_status()
-        unit.result = r.json()["content"].strip()
+        try:
+            r = self.client.post(
+                f"{backend.url}/completion",
+                json={
+                    "prompt": build_prompt(unit.text, unit.context),
+                    "n_predict": min(400, 48 + len(unit.text) * 3),
+                    "temperature": 0,
+                    "stop": _STOP,
+                    "cache_prompt": False,
+                },
+            )
+            r.raise_for_status()
+            unit.result = r.json()["content"].strip()
+        except (httpx.HTTPError, KeyError, ValueError):
+            unit.result = ""  # leave this piece untranslated rather than fail the screen
+            return
         self._remember(unit.text, unit.result)
 
     def warm_up(self) -> None:
