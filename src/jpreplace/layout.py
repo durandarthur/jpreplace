@@ -9,6 +9,7 @@ from .ocr import Line
 
 _JAPANESE = re.compile(r"[぀-ヿ㐀-䶿一-鿿ｦ-ﾟ]")
 _ASCII_WORD = re.compile(r"[A-Za-z0-9]")
+_MIN_WRAPPED_CHARS = 12  # a line shorter than this is a label, not a wrapped line
 
 Box = tuple[float, float, float, float]
 
@@ -58,23 +59,29 @@ def _same_paragraph(a: Line, b: Line) -> bool:
             return False
         return _overlap(ay0, ay1, by0, by1) >= 0.5 * min(ay1 - ay0, by1 - by0)
 
-    # Fragments of the same row (boxes already include some end padding).
+    # Fragments of the same row. Japanese has no spaces, so a visible gap
+    # means separate items (menu entries, table cells): only join boxes that
+    # overlap, i.e. whose text is closer than the padding the detector adds.
     if _overlap(ay0, ay1, by0, by1) >= 0.7 * t:
         gap = max(ax0, bx0) - min(ax1, bx1)
-        return gap <= 0.3 * t
+        return gap <= -0.2 * t
 
     # Consecutive rows: `a` is the upper one.
+    upper = a
     if ay0 > by0:
+        upper = b
         (ax0, ay0, ax1, ay1), (bx0, by0, bx1, by1) = (bx0, by0, bx1, by1), (ax0, ay0, ax1, ay1)
     gap = by0 - ay1
     if not -0.5 * t <= gap <= 0.9 * t:
         return False
     left = abs(ax0 - bx0) <= t
     centre = abs((ax0 + ax1) - (bx0 + bx1)) / 2 <= t
-    if centre:
-        return True
+    if centre and not left:
+        return True  # centred lines of different widths: a caption or bubble
     # Left-aligned wrapped text: every line but the last runs to the margin.
-    return left and ax1 >= bx1 - 2.5 * t
+    # Lists and menus look the same geometrically, but their items are short,
+    # and merging those is worse than splitting a narrow paragraph.
+    return left and ax1 >= bx1 - t and len(upper.text) >= _MIN_WRAPPED_CHARS
 
 
 def _join(parts: list[str]) -> str:

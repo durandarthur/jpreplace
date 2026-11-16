@@ -66,7 +66,17 @@ def _text_colour(region: np.ndarray, dist: np.ndarray, background: np.ndarray) -
     """Median colour of the pixels that stand out most from the background."""
     peak = float(np.percentile(dist, 98)) if dist.size else 0.0
     if peak >= 90:
-        b, g, r = np.median(region[dist >= 0.7 * peak], axis=0)
+        # The dominant ink colour first (so a few darker marks next to the
+        # text, like a bullet or an arrow, do not win), then the solid core
+        # of that colour rather than its anti-aliased fringe.
+        pixels = region.astype(np.float32)
+        dominant = np.median(pixels[dist >= 0.5 * peak], axis=0)
+        family = np.abs(pixels - dominant).sum(axis=1) < 120
+        if family.any():
+            core = dist[family] >= 0.8 * np.percentile(dist[family], 95)
+            b, g, r = np.median(pixels[family][core], axis=0)
+        else:
+            b, g, r = dominant
         return int(r), int(g), int(b)
     return (20, 20, 20) if float(background @ _LUMA) > 128 else (240, 240, 240)
 
