@@ -54,7 +54,21 @@ def _order_quad(pts: np.ndarray) -> np.ndarray:
     return np.array([tl, tr, br, bl], dtype=np.float32)
 
 
-_KANA = "ぁ-ゖァ-ヺ"
+def _snap(quad: np.ndarray) -> np.ndarray:
+    """Replace a (nearly) axis-aligned quad by its integer bounding box."""
+    x0, y0 = np.floor(quad.min(axis=0))
+    x1, y1 = np.ceil(quad.max(axis=0))
+    if (x1 - x0) * (y1 - y0) > 1.1 * cv2.contourArea(quad) + 16:
+        return quad
+    return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+
+
+def _is_upright(quad: np.ndarray) -> bool:
+    tl, tr, br, bl = quad
+    return tl[1] == tr[1] and bl[1] == br[1] and tl[0] == bl[0] and tr[0] == br[0]
+
+
+_KANA ="ぁ-ゖァ-ヺ"
 _KANA_DASH = re.compile(f"(?<=[{_KANA}])[-‐−–—](?=[{_KANA}]|$)")
 
 
@@ -72,10 +86,12 @@ class OCR:
         max_side: int = 2560,
         rec_batch: int = 32,
         min_score: float = 0.6,
-        end_pad: float = 0.1,
+        end_pad: float = 0.3,
+        side_pad: float = 0.1,
         scale: float = 1.0,
     ) -> None:
         self.end_pad = end_pad
+        self.side_pad = side_pad
         self.scale = scale
         if use_gpu and hasattr(ort, "preload_dlls"):
             ort.preload_dlls()
@@ -120,17 +136,54 @@ class OCR:
                 continue
             # Grow the shrunken DB kernel back to the full text extent.
             d = bw * bh * self.unclip_ratio / (2 * (bw + bh))
-            # Extra margin along the reading direction: short labels otherwise
-            # lose part of their first/last character.
-            pad = self.end_pad * min(bw, bh)
-            ew, eh = (pad, 0.0) if bw >= bh else (0.0, pad)
-            pts = cv2.boxPoints(((cx, cy), (bw + 2 * d + 2 * ew, bh + 2 * d + 2 * eh), angle))
-            if min(bw, bh) + 2 * d < 5:
+            thickness = min(bw, bh) + 2 * d
+            if thickness < 5:
                 continue
-            pts[:, 0] = np.clip(pts[:, 0] * sx, 0, w - 1)
-            pts[:, 1] = np.clip(pts[:, 1] * sy, 0, h - 1)
-            quads.append(_order_quad(pts))
+            # The recogniser wants a little air around the glyphs, and more of
+            # it along the reading direction, where tight boxes clip characters.
+            end, side = self.end_pad * thickness, self.side_pad * thickness
+            ew, eh = (end, side) if bw >= bh else (side, end)
+            pts = cv2.boxPoints(((cx, cy), (bw + 2 * d + 2 * ew, bh + 2 * d + 2 * eh), angle))
+            pts[:, 0] = np.clip(pts[:, 0] * sx, 0, w)
+            pts[:, 1] = np.clip(pts[:, 1] * sy, 0, h)
+            quads.append(_snap(_order_quad(pts)))
         return quads
+
+    def _extend_ends(self, bgr: np.ndarray, quad: np.ndarray) -> np.ndarray:
+        """Grow an upright box over trailing punctuation the detector missed
+        (typically the 。 that ends a vertical column)."""
+        if not _is_upright(quad):
+            return quad
+        h, w = bgr.shape[:2]
+        x0, y0 = quad[0].astype(int)
+        x1, y1 = quad[2].astype(int)
+        vertical = (y1 - y0) >= 1.5 * (x1 - x0)
+        thickness = (x1 - x0) if vertical else (y1 - y0)
+        reach = int(thickness * 0.9)
+        if vertical:
+            ext = bgr[y1 : min(h, y1 + reach), x0:x1]
+        else:
+            ext = bgr[y0:y1, x1 : min(w, x1 + reach)].transpose(1, 0, 2)
+        if ext.shape[0] < 4 or ext.shape[1] < 4:
+            return quad
+        background = np.median(bgr[y0:y1, x0:x1].reshape(-1, 3), axis=0)
+        ink = (np.abs(ext.astype(np.int16) - background.astype(np.int16)).max(axis=2) > 60).sum(axis=1)
+        rows = np.flatnonzero(ink)
+        if len(rows) == 0 or rows[0] > 0.6 * reach:
+            return quad
+        # Take the first run of inked rows; it only counts as punctuation if it
+        # is small and followed by clear space.
+        breaks = np.flatnonzero(np.diff(rows) > 3)
+        last = int(rows[breaks[0]] if len(breaks) else rows[-1])
+        if last >= ext.shape[0] - 3 or last - rows[0] > 0.7 * thickness or ink[: last + 1].sum() < 4:
+            return quad
+        grow = last + 3
+        quad = quad.copy()
+        if vertical:
+            quad[2:, 1] = min(h, y1 + grow)
+        else:
+            quad[1:3, 0] = min(w, x1 + grow)
+        return quad
 
     @staticmethod
     def _box_score(prob: np.ndarray, contour: np.ndarray) -> float:
@@ -144,12 +197,16 @@ class OCR:
     @staticmethod
     def _crop(bgr: np.ndarray, quad: np.ndarray) -> tuple[np.ndarray, bool]:
         tl, tr, br, bl = quad
-        cw = int(round(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl))))
-        ch = int(round(max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr))))
-        cw, ch = max(cw, 1), max(ch, 1)
-        dst = np.array([[0, 0], [cw, 0], [cw, ch], [0, ch]], dtype=np.float32)
-        m = cv2.getPerspectiveTransform(quad, dst)
-        crop = cv2.warpPerspective(bgr, m, (cw, ch), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        if _is_upright(quad):
+            # Plain slicing keeps small screen text pixel-exact.
+            crop = bgr[int(tl[1]) : int(br[1]), int(tl[0]) : int(br[0])]
+            ch, cw = crop.shape[:2]
+        else:
+            cw = max(1, int(round(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl)))))
+            ch = max(1, int(round(max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr)))))
+            dst = np.array([[0, 0], [cw, 0], [cw, ch], [0, ch]], dtype=np.float32)
+            m = cv2.getPerspectiveTransform(quad, dst)
+            crop = cv2.warpPerspective(bgr, m, (cw, ch), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
         vertical = ch >= cw * 1.5
         if vertical:
             crop = np.rot90(crop)
@@ -187,7 +244,7 @@ class OCR:
     def __call__(self, bgr: np.ndarray) -> list[Line]:
         if self.scale != 1.0:  # upscaling helps with very small UI text
             bgr = cv2.resize(bgr, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_CUBIC)
-        quads = self.detect(bgr)
+        quads = [self._extend_ends(bgr, q) for q in self.detect(bgr)]
         if not quads:
             return []
         cropped = [self._crop(bgr, q) for q in quads]
