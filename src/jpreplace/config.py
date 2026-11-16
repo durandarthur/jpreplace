@@ -66,10 +66,13 @@ class Settings:
     ocr: str = "medium"
     llama_port: int = 8765
     parallel: int = 8
-    hotkey: str = "ctrl+shift+t"
+    hotkey_translate: str = "ctrl+alt+t"
+    hotkey_clear: str = "ctrl+alt+c"
+    hotkey_live: str = "ctrl+alt+l"
     live: bool = False
     live_interval_ms: int = 400
     font_family: str = "Segoe UI"
+    ocr_scale: float = 1.0  # 2.0 helps with very small text, at some speed cost
     geometry: list[int] = field(default_factory=lambda: [200, 200, 900, 600])
 
     @classmethod

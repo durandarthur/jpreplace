@@ -27,6 +27,16 @@ class Result:
         return sum(self.timings.values())
 
 
+def same_layout(a: list[Block], b: list[Block], tolerance: float = 6.0) -> bool:
+    """True if two OCR passes found the same text in the same places."""
+    if len(a) != len(b):
+        return False
+    for x, y in zip(a, b):
+        if x.text != y.text or max(abs(p - q) for p, q in zip(x.box, y.box)) > tolerance:
+            return False
+    return True
+
+
 class Pipeline:
     def __init__(self, settings: config.Settings) -> None:
         self.settings = settings
@@ -41,7 +51,7 @@ class Pipeline:
         det_dir, rec_dir = assets.ensure_ocr(s.ocr)
         model = assets.ensure_translator(s.translator)
         status("Loading OCR…")
-        self.ocr = OCR(det_dir, rec_dir)
+        self.ocr = OCR(det_dir, rec_dir, scale=s.ocr_scale)
         status("Loading translator…")
         self.server = LlamaServer(exe, model, port=s.llama_port, parallel=s.parallel)
         self.server.start()
@@ -61,6 +71,21 @@ class Pipeline:
         """OCR a BGR frame and return the Japanese text blocks."""
         assert self.ocr is not None
         return [b for b in group_lines(self.ocr(frame)) if has_japanese(b.text)]
+
+    def fill_cached(self, blocks: list[Block]) -> int:
+        """Apply already-known translations; return how many blocks lack one."""
+        assert self.translator is not None
+        missing = 0
+        for block in blocks:
+            hit = self.translator.cached(block.text)
+            if hit is None:
+                missing += 1
+            else:
+                block.translation = hit
+        return missing
+
+    def draw(self, frame: np.ndarray, blocks: list[Block]) -> QImage:
+        return render(frame, blocks, self.settings.font_family)
 
     def run(self, frame: np.ndarray, blocks: list[Block] | None = None) -> Result:
         assert self.translator is not None
