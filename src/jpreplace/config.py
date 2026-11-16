@@ -62,10 +62,13 @@ def ocr_dir(repo: str) -> Path:
 
 @dataclass
 class Settings:
-    translator: str = "plamo-8b"
+    # "plamo-8b" (best quality), "plamo-2b" (fastest, least VRAM) or "auto" (both
+    # loaded; the 2B takes over when a screen has too much text for the 8B).
+    translator: str = "auto"
+    quality_max_chars: int = 1200  # auto: more untranslated characters than this -> 2B
     ocr: str = "medium"
     llama_port: int = 8765
-    parallel: int = 8
+    parallel: int = 16
     hotkey_translate: str = "ctrl+alt+t"
     hotkey_clear: str = "ctrl+alt+c"
     hotkey_live: str = "ctrl+alt+l"

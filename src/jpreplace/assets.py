@@ -6,6 +6,7 @@ import argparse
 import sys
 import zipfile
 from pathlib import Path
+from typing import Callable
 
 import httpx
 from huggingface_hub import hf_hub_download
@@ -34,7 +35,10 @@ def _download(url: str, dest: Path) -> None:
     tmp.replace(dest)
 
 
-def ensure_llama() -> Path:
+Status = Callable[[str], None]
+
+
+def ensure_llama(status: Status = print) -> Path:
     exe = llama_server_path()
     marker = config.LLAMA_DIR / f".{config.LLAMA_BUILD}"
     if exe.exists() and marker.exists():
@@ -42,7 +46,7 @@ def ensure_llama() -> Path:
     for name in config.LLAMA_ASSETS:
         url = config.LLAMA_URL.format(build=config.LLAMA_BUILD, name=name)
         archive = config.RUNTIME_DIR / name
-        print(f"Downloading {name}")
+        status(f"Downloading {name}…")
         _download(url, archive)
         with zipfile.ZipFile(archive) as z:
             z.extractall(config.LLAMA_DIR)
@@ -53,25 +57,25 @@ def ensure_llama() -> Path:
     return exe
 
 
-def _hf(repo: str, filename: str) -> Path:
+def _hf(repo: str, filename: str, status: Status) -> Path:
     local_dir = config.MODELS_DIR / repo.split("/")[-1]
     target = local_dir / filename
     if target.exists():
         return target
-    print(f"Downloading {repo}/{filename}")
+    status(f"Downloading {filename} (first run only)…")
     return Path(hf_hub_download(repo, filename, local_dir=local_dir))
 
 
-def ensure_translator(name: str) -> Path:
+def ensure_translator(name: str, status: Status = print) -> Path:
     f = config.TRANSLATORS[name]
-    return _hf(f.repo, f.filename)
+    return _hf(f.repo, f.filename, status)
 
 
-def ensure_ocr(name: str) -> tuple[Path, Path]:
+def ensure_ocr(name: str, status: Status = print) -> tuple[Path, Path]:
     det, rec = config.OCR_MODELS[name]
     for repo in (det, rec):
         for filename in config.OCR_FILES:
-            _hf(repo, filename)
+            _hf(repo, filename, status)
     return config.ocr_dir(det), config.ocr_dir(rec)
 
 

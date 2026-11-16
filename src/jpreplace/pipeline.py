@@ -11,9 +11,9 @@ from PySide6.QtGui import QImage
 
 from . import assets, config
 from .layout import Block, group_lines, has_japanese
-from .ocr import OCR
+from .ocr import OCR, Line
 from .render import render
-from .translate import LlamaServer, Translator
+from .translate import Backend, LlamaServer, Translator
 
 
 @dataclass
@@ -41,31 +41,51 @@ class Pipeline:
     def __init__(self, settings: config.Settings) -> None:
         self.settings = settings
         self.ocr: OCR | None = None
-        self.server: LlamaServer | None = None
+        self.servers: list[LlamaServer] = []
         self.translator: Translator | None = None
 
     def load(self, status: Callable[[str], None] = lambda _msg: None) -> None:
         s = self.settings
         status("Checking models…")
-        exe = assets.ensure_llama()
-        det_dir, rec_dir = assets.ensure_ocr(s.ocr)
-        model = assets.ensure_translator(s.translator)
+        exe = assets.ensure_llama(status)
+        det_dir, rec_dir = assets.ensure_ocr(s.ocr, status)
+        # "auto" keeps both models loaded: the 8B for quality, and the 2B to
+        # stay fast when a screen holds more text than the 8B can do in time.
+        names = ["plamo-8b", "plamo-2b"] if s.translator == "auto" else [s.translator]
+        models = [assets.ensure_translator(name, status) for name in names]
         status("Loading OCR…")
         self.ocr = OCR(det_dir, rec_dir, scale=s.ocr_scale)
         status("Loading translator…")
-        self.server = LlamaServer(exe, model, port=s.llama_port, parallel=s.parallel)
-        self.server.start()
-        self.translator = Translator(self.server.url, parallel=s.parallel)
+        backends = []
+        for i, model in enumerate(models):
+            server = LlamaServer(exe, model, port=s.llama_port + i, parallel=s.parallel)
+            self.servers.append(server)
+            server.start()
+            limit = s.quality_max_chars if i < len(models) - 1 else 0
+            backends.append(Backend(server.url, s.parallel, limit))
+        self.translator = Translator(backends)
         status("Warming up…")
-        self.ocr(np.full((96, 320, 3), 255, dtype=np.uint8))
-        self.translator.translate(["準備完了"], use_context=False)
-        self.translator.cache.clear()
+        self.ocr.warm_up()
+        self.translator.warm_up()
+        # First use of the text renderer loads fonts; do it now, not on the
+        # first translation.
+        sample = np.full((96, 320, 3), 255, dtype=np.uint8)
+        quad = np.array([[8, 8], [200, 8], [200, 40], [8, 40]], dtype=np.float32)
+        block = group_lines([Line(quad, "準備", 1.0, False)])[0]
+        block.translation = "Ready"
+        render(sample, [block], s.font_family)
+
+    def prepare(self, height: int, width: int) -> None:
+        """Get the detector ready for captures of this size."""
+        assert self.ocr is not None
+        scale = self.settings.ocr_scale
+        self.ocr.warm_up_detector(int(height * scale), int(width * scale))
 
     def close(self) -> None:
         if self.translator:
             self.translator.close()
-        if self.server:
-            self.server.stop()
+        for server in self.servers:
+            server.stop()
 
     def read(self, frame: np.ndarray) -> list[Block]:
         """OCR a BGR frame and return the Japanese text blocks."""

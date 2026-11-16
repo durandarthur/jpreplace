@@ -64,6 +64,14 @@ class Worker(QObject):
             traceback.print_exc()
             self.failed.emit(f"Startup failed: {exc}")
 
+    @Slot(tuple)
+    def prepare(self, rect: tuple[int, int, int, int]) -> None:
+        """The frame was resized: tune the detector for the new size now."""
+        try:
+            self.pipeline.prepare(rect[3], rect[2])
+        except Exception:
+            traceback.print_exc()
+
     @Slot()
     def forget(self) -> None:
         """The overlay was cleared or moved; start from scratch next time."""
@@ -170,6 +178,7 @@ class Frame(QWidget):
     request_translate = Signal(tuple)
     request_tick = Signal(tuple)
     request_forget = Signal()
+    request_prepare = Signal(tuple)
 
     def __init__(self, settings: Settings) -> None:
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
@@ -216,6 +225,11 @@ class Frame(QWidget):
         self.timer = QTimer(self)
         self.timer.setInterval(settings.live_interval_ms)
         self.timer.timeout.connect(self._tick)
+        # After a resize settles, let the worker get ready for the new size.
+        self.resized = QTimer(self)
+        self.resized.setSingleShot(True)
+        self.resized.setInterval(400)
+        self.resized.timeout.connect(self._prepare)
 
         x, y, w, h = settings.geometry
         self.setGeometry(x, y, w, h)
@@ -241,6 +255,11 @@ class Frame(QWidget):
 
     def resizeEvent(self, _event) -> None:
         self._sync()
+        self.resized.start()
+
+    def _prepare(self) -> None:
+        if self.loaded and self.isVisible():
+            self.request_prepare.emit(self.capture_rect())
 
     def moveEvent(self, _event) -> None:
         self._sync()
@@ -339,6 +358,7 @@ class Frame(QWidget):
         self.translate_button.setEnabled(True)
         self.live_button.setEnabled(True)
         self.set_status(f"Ready — {self.settings.hotkey_translate} to translate")
+        self._prepare()
         if self.settings.live:
             self.live_button.setChecked(True)
 
@@ -411,6 +431,7 @@ def run(argv: list[str] | None = None) -> int:
     frame.request_translate.connect(worker.translate)
     frame.request_tick.connect(worker.tick)
     frame.request_forget.connect(worker.forget)
+    frame.request_prepare.connect(worker.prepare)
     thread.start()
 
     frame.show()

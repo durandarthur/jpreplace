@@ -94,6 +94,7 @@ def main() -> int:
     frame.request_translate.connect(worker.translate)
     frame.request_tick.connect(worker.tick)
     frame.request_forget.connect(worker.forget)
+    frame.request_prepare.connect(worker.prepare)
 
     def save_view(name: str) -> None:
         """What the user sees: the page with the overlay canvas on top."""

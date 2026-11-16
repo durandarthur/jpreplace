@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import atexit
+import re
+import socket
 import subprocess
+import sys
 import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import httpx
 
 _STOP = ["<|plamo:tag|>", "<|plamo:bos|>"]
 _CTX_PER_SLOT = 2048
-_MAX_CONTEXT_CHARS = 400
+_CHUNK_CHARS = 70  # long blocks are split into sentence groups of about this size
+_LABEL_CHARS = 90  # units shorter than this get surrounding text as context
+_CONTEXT_BUDGET = 1500  # total context characters per screen; context costs time
+_SENTENCE_END = re.compile(r"(?<=[。！？!?])(?![。！？!?」』）)\]】])")
 
 
 def build_prompt(text: str, context: str = "") -> str:
@@ -35,11 +41,11 @@ class LlamaServer:
         self.exe, self.model, self.port, self.parallel = exe, model, port, parallel
         self.url = f"http://127.0.0.1:{port}"
         self.proc: subprocess.Popen | None = None
-        self.log_path = exe.parent.parent / "llama-server.log"
+        self.log_path = exe.parent.parent / f"llama-server-{model.stem}.log"
 
     def start(self, timeout: float = 120.0) -> None:
-        if self.healthy():
-            return  # reuse a server that is already running on this port
+        self.port = _free_port(self.port)
+        self.url = f"http://127.0.0.1:{self.port}"
         cmd = [
             str(self.exe),
             "-m", str(self.model),
@@ -48,6 +54,9 @@ class LlamaServer:
             "-ngl", "999",
             "-np", str(self.parallel),
             "-c", str(self.parallel * _CTX_PER_SLOT),
+            # One shared KV cache: with per-slot caches llama.cpp cannot batch
+            # requests of different lengths together, which halves throughput.
+            "--kv-unified",
             "--no-webui",
         ]
         log = open(self.log_path, "w", encoding="utf-8", errors="replace")
@@ -59,6 +68,11 @@ class LlamaServer:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         atexit.register(self.stop)
+        if sys.platform == "win32":
+            from . import win32
+
+            # Never leave a multi-gigabyte model behind if we die unexpectedly.
+            win32.kill_with_parent(int(self.proc._handle))
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
@@ -85,23 +99,74 @@ class LlamaServer:
         self.proc = None
 
 
-class Translator:
-    """Translates many text blocks concurrently, with an LRU cache."""
+def _free_port(preferred: int) -> int:
+    """`preferred` if nothing is listening there, otherwise any free port."""
+    for port in (preferred, 0):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return s.getsockname()[1]
+            except OSError:
+                continue
+    raise RuntimeError("no free local port for llama-server")
 
-    def __init__(self, url: str, parallel: int = 8, cache_size: int = 4096) -> None:
-        self.url = url
-        self.parallel = parallel
-        self.client = httpx.Client(timeout=60.0, limits=httpx.Limits(max_connections=parallel * 2))
-        self.pool = ThreadPoolExecutor(max_workers=parallel, thread_name_prefix="translate")
+
+def split_sentences(text: str, limit: int = _CHUNK_CHARS) -> list[str]:
+    """Split a long block into chunks of whole sentences. Generation speed per
+    request is fixed, so many short requests in parallel finish far sooner
+    than one long one."""
+    if len(text) <= limit * 1.3:
+        return [text]
+    chunks: list[str] = []
+    for sentence in _SENTENCE_END.split(text):
+        if not sentence:
+            continue
+        if chunks and len(chunks[-1]) + len(sentence) <= limit:
+            chunks[-1] += sentence
+        else:
+            chunks.append(sentence)
+    return chunks
+
+
+@dataclass
+class Backend:
+    """One llama-server. `max_chars` is the largest amount of untranslated
+    Japanese it can handle within the time budget (0 = no limit)."""
+
+    url: str
+    parallel: int
+    max_chars: int = 0
+
+
+@dataclass
+class _Unit:
+    block: int
+    text: str
+    context: str = ""
+    result: str | None = None
+
+
+class Translator:
+    """Translates the text blocks of a screen concurrently, with an LRU cache.
+
+    With several backends (best quality first) the best one that can finish
+    the pending work within its budget is used."""
+
+    def __init__(self, backends: list[Backend], cache_size: int = 8192) -> None:
+        self.backends = backends
+        workers = max(b.parallel for b in backends)
+        self.client = httpx.Client(timeout=60.0, limits=httpx.Limits(max_connections=workers * 2))
+        self.pools = [ThreadPoolExecutor(b.parallel, thread_name_prefix="translate") for b in backends]
         self.cache: OrderedDict[str, str] = OrderedDict()
         self.cache_size = cache_size
         self._lock = threading.Lock()
 
     def close(self) -> None:
-        self.pool.shutdown(wait=False, cancel_futures=True)
+        for pool in self.pools:
+            pool.shutdown(wait=False, cancel_futures=True)
         self.client.close()
 
-    def cached(self, text: str) -> str | None:
+    def _lookup(self, text: str) -> str | None:
         with self._lock:
             hit = self.cache.get(text)
             if hit is not None:
@@ -114,70 +179,91 @@ class Translator:
             while len(self.cache) > self.cache_size:
                 self.cache.popitem(last=False)
 
-    def _request(self, text: str, context: str) -> str:
-        max_tokens = min(768, 48 + len(text) * 3)
+    def cached(self, text: str) -> str | None:
+        """The translation of a block if every part of it is already known."""
+        parts = [self._lookup(chunk) for chunk in split_sentences(text)]
+        return None if None in parts else " ".join(parts)
+
+    def _request(self, backend: Backend, unit: _Unit) -> None:
         r = self.client.post(
-            f"{self.url}/completion",
+            f"{backend.url}/completion",
             json={
-                "prompt": build_prompt(text, context),
-                "n_predict": max_tokens,
+                "prompt": build_prompt(unit.text, unit.context),
+                "n_predict": min(768, 48 + len(unit.text) * 3),
                 "temperature": 0,
                 "stop": _STOP,
                 "cache_prompt": False,
             },
         )
         r.raise_for_status()
-        return r.json()["content"].strip()
+        unit.result = r.json()["content"].strip()
+        self._remember(unit.text, unit.result)
 
-    def translate_one(self, text: str, context: str = "") -> str:
-        hit = self.cached(text)
-        if hit is not None:
-            return hit
-        out = self._request(text, context)
-        self._remember(text, out)
+    def warm_up(self) -> None:
+        """Run one tiny request through every backend so the first real
+        translation does not pay for lazy initialisation."""
+        for backend in self.backends:
+            self._request(backend, _Unit(0, "準備完了"))
+        self.cache.clear()
+
+    def pick_backend(self, pending_chars: int) -> int:
+        for i, backend in enumerate(self.backends):
+            if not backend.max_chars or pending_chars <= backend.max_chars:
+                return i
+        return len(self.backends) - 1
+
+    def translate(self, texts: list[str], use_context: bool = True) -> list[str]:
+        """Translate `texts`, the blocks of one screen in reading order."""
+        units = [_Unit(i, chunk) for i, text in enumerate(texts) for chunk in split_sentences(text)]
+        pending = []
+        for unit in units:
+            unit.result = self._lookup(unit.text)
+            if unit.result is None:
+                pending.append(unit)
+        if pending:
+            if use_context:
+                _add_context(units, texts)
+            choice = self.pick_backend(sum(len(u.text) for u in pending))
+            backend, pool = self.backends[choice], self.pools[choice]
+            # Longest first, so the slowest request starts earliest.
+            pending.sort(key=lambda u: -len(u.text))
+            for future in [pool.submit(self._request, backend, unit) for unit in pending]:
+                future.result()
+        out = [""] * len(texts)
+        for unit in units:
+            out[unit.block] = f"{out[unit.block]} {unit.result}".strip()
         return out
 
-    def translate(
-        self,
-        texts: list[str],
-        use_context: bool = True,
-        on_result: Callable[[int, str], None] | None = None,
-    ) -> list[str]:
-        """Translate `texts` (in reading order). Longest blocks are sent first
-        so the slowest request starts earliest."""
-        results: list[str | None] = [None] * len(texts)
-        pending = []
-        for i, text in enumerate(texts):
-            hit = self.cached(text)
-            if hit is not None:
-                results[i] = hit
-                if on_result:
-                    on_result(i, hit)
-            else:
-                pending.append(i)
-        pending.sort(key=lambda i: -len(texts[i]))
 
-        def work(i: int) -> None:
-            context = _neighbour_context(texts, i) if use_context else ""
-            results[i] = self.translate_one(texts[i], context)
-            if on_result:
-                on_result(i, results[i])
+def _add_context(units: list[_Unit], texts: list[str]) -> None:
+    """Give each untranslated unit some surrounding text to disambiguate it.
 
-        for future in [self.pool.submit(work, i) for i in pending]:
-            future.result()
-        return [r or "" for r in results]
-
-
-def _neighbour_context(texts: list[str], i: int) -> str:
-    """Nearby blocks on screen, so short labels are translated in context."""
-    picked: list[tuple[int, str]] = []
-    budget = _MAX_CONTEXT_CHARS
-    for offset in range(1, len(texts)):
-        for j in (i - offset, i + offset):
-            if 0 <= j < len(texts) and budget > 0:
-                snippet = texts[j][:budget]
-                picked.append((j, snippet))
-                budget -= len(snippet)
-        if budget <= 0:
-            break
-    return "\n".join(t for _, t in sorted(picked))
+    A later sentence of a block gets the sentence before it. A short block (a
+    label, a button) gets its neighbours on screen. Long self-contained
+    text gets nothing: context is prompt tokens, and those cost time."""
+    wants: list[tuple[_Unit, str]] = []
+    for index, unit in enumerate(units):
+        if unit.result is not None:
+            continue
+        previous = units[index - 1] if index and units[index - 1].block == unit.block else None
+        if previous is not None:
+            wants.append((unit, previous.text[-50:]))
+            continue
+        room = _LABEL_CHARS - len(unit.text)
+        if room <= 0:
+            continue
+        picked: list[tuple[int, str]] = []
+        for offset in range(1, len(texts)):
+            for j in (unit.block - offset, unit.block + offset):
+                if 0 <= j < len(texts) and room > 0:
+                    snippet = texts[j][:room]
+                    picked.append((j, snippet))
+                    room -= len(snippet)
+            if room <= 0:
+                break
+        wants.append((unit, "\n".join(t for _, t in sorted(picked))))
+    total = sum(len(context) for _, context in wants)
+    scale = min(1.0, _CONTEXT_BUDGET / total) if total else 1.0
+    for unit, context in wants:
+        keep = int(len(context) * scale)
+        unit.context = context[:keep] if keep >= 8 else ""

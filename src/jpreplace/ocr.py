@@ -15,7 +15,7 @@ import yaml
 _DET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32) * 255.0
 _DET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32) * 255.0
 _REC_HEIGHT = 48
-_REC_WIDTH_STEP = 96  # pad batch widths to multiples of this to limit distinct shapes
+_REC_WIDTH_STEP = 128  # batch widths are padded to multiples of this
 _REC_MAX_WIDTH = 3200
 
 
@@ -43,6 +43,35 @@ def _session(path: Path, use_gpu: bool) -> ort.InferenceSession:
         # HEURISTIC avoids a slow exhaustive cuDNN search on every new input shape.
         providers.insert(0, ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}))
     return ort.InferenceSession(str(path), sess_options=opts, providers=providers)
+
+
+def _argmax_model(path: Path) -> Path:
+    """A copy of the recogniser that returns the best class and its score per
+    time step instead of the full probability table. The table is hundreds of
+    megabytes per batch, and copying it off the GPU dominated OCR time."""
+    out = path.with_name("inference.argmax.onnx")
+    if out.exists() and out.stat().st_mtime >= path.stat().st_mtime:
+        return out
+    import onnx
+    from onnx import TensorProto, helper
+
+    model = onnx.load(str(path))
+    probs = model.graph.output[0].name
+    model.graph.node.extend(
+        [
+            helper.make_node("ArgMax", [probs], ["ids"], axis=2, keepdims=0),
+            helper.make_node("ReduceMax", [probs], ["conf"], axes=[2], keepdims=0),
+        ]
+    )
+    del model.graph.output[:]
+    model.graph.output.extend(
+        [
+            helper.make_tensor_value_info("ids", TensorProto.INT64, None),
+            helper.make_tensor_value_info("conf", TensorProto.FLOAT, None),
+        ]
+    )
+    onnx.save(model, str(out))
+    return out
 
 
 def _order_quad(pts: np.ndarray) -> np.ndarray:
@@ -84,7 +113,7 @@ class OCR:
         rec_dir: Path,
         use_gpu: bool = True,
         max_side: int = 2560,
-        rec_batch: int = 32,
+        rec_batch: int = 8,  # small batches of similar width waste less padding
         min_score: float = 0.6,
         end_pad: float = 0.3,
         side_pad: float = 0.1,
@@ -107,7 +136,7 @@ class OCR:
         self.chars = ["", *[str(c) for c in rec_cfg["PostProcess"]["character_dict"]], " "]
 
         self.det = _session(det_dir / "inference.onnx", use_gpu)
-        self.rec = _session(rec_dir / "inference.onnx", use_gpu)
+        self.rec = _session(_argmax_model(rec_dir / "inference.onnx"), use_gpu)
         self.det_in = self.det.get_inputs()[0].name
         self.rec_in = self.rec.get_inputs()[0].name
         self.providers = self.det.get_providers()
@@ -218,18 +247,28 @@ class OCR:
         order = np.argsort(widths)
         for start in range(0, len(order), self.rec_batch):
             idx = order[start : start + self.rec_batch]
-            bw = max(widths[i] for i in idx)
-            bw = max(160, math.ceil(bw / _REC_WIDTH_STEP) * _REC_WIDTH_STEP)
-            batch = np.zeros((len(idx), 3, _REC_HEIGHT, bw), dtype=np.float32)
+            bw = math.ceil(max(widths[i] for i in idx) / _REC_WIDTH_STEP) * _REC_WIDTH_STEP
+            # Always a full batch: together with the width buckets this keeps
+            # the set of input shapes small, and each new shape costs a pause.
+            batch = np.zeros((self.rec_batch, 3, _REC_HEIGHT, bw), dtype=np.float32)
             for row, i in enumerate(idx):
                 img = cv2.resize(crops[i], (widths[i], _REC_HEIGHT), interpolation=cv2.INTER_LINEAR)
                 batch[row, :, :, : widths[i]] = (img.astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)
-            probs = self.rec.run(None, {self.rec_in: batch})[0]
-            ids = probs.argmax(axis=2)
-            conf = probs.max(axis=2)
+            ids, conf = self.rec.run(None, {self.rec_in: batch})
             for row, i in enumerate(idx):
                 results[i] = self._ctc_decode(ids[row], conf[row])
         return results
+
+    def warm_up(self, max_width: int = 2560) -> None:
+        """Run every common recogniser input shape once. The GPU backend tunes
+        itself per shape on first use, which would otherwise delay the first
+        translations by up to a second."""
+        for width in range(_REC_WIDTH_STEP, max_width + 1, _REC_WIDTH_STEP):
+            self.rec.run(None, {self.rec_in: np.zeros((self.rec_batch, 3, _REC_HEIGHT, width), np.float32)})
+
+    def warm_up_detector(self, height: int, width: int) -> None:
+        """Same, for the detector at a given capture size."""
+        self.detect(np.zeros((max(32, height), max(32, width), 3), np.uint8))
 
     def _ctc_decode(self, ids: np.ndarray, conf: np.ndarray) -> tuple[str, float]:
         keep = ids != 0

@@ -26,6 +26,50 @@ user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.UnregisterHotKey.restype = wintypes.BOOL
 
 
+class _JobLimits(ctypes.Structure):
+    """JOBOBJECT_EXTENDED_LIMIT_INFORMATION, flattened."""
+
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+        ("IoInfo", ctypes.c_uint64 * 6),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+_job_handles: list[int] = []  # kept open for the life of this process
+
+
+def kill_with_parent(process_handle: int) -> bool:
+    """Tie a child process to ours: when this process ends for any reason
+    (including a crash or Task Manager), Windows terminates the child too."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return False
+    limits = _JobLimits()
+    limits.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    ok = kernel32.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits))
+    ok = ok and kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(process_handle))
+    if ok:
+        _job_handles.append(job)
+    return bool(ok)
+
+
 def exclude_from_capture(hwnd: int) -> bool:
     """Hide a window from screen capture (it stays visible on the monitor)."""
     return bool(user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE))
