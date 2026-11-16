@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# Downloaded at setup time (llama.cpp binaries, model weights)
+runtime/
+models/
+# Local scratch output
+out/
+settings.json
+*.log
