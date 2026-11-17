@@ -1,6 +1,6 @@
 [project]
 name = "jpreplace"
-version = "0.1.0"
+version = "0.2.0"
 description = "Screen overlay that replaces Japanese text with English using local AI"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -9,6 +9,7 @@ dependencies = [
     "opencv-python-headless>=4.10",
     "onnxruntime-gpu[cuda,cudnn]>=1.32",
     "mss>=10.0",
+    "dxcam>=0.3.0,<0.4",
     "httpx>=0.28",
     "huggingface-hub>=1.0",
     "pyyaml>=6.0",

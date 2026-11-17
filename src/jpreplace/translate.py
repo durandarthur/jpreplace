@@ -1,4 +1,5 @@
-"""Japanese -> English translation with PLaMo 3 Translate on a local llama.cpp server."""
+"""Japanese -> English translation with an LLM: PLaMo 3 Translate (or any GGUF
+model) on a local llama.cpp server, or any OpenAI-compatible API."""
 
 from __future__ import annotations
 
@@ -11,18 +12,30 @@ import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
 _STOP = ["<|plamo:tag|>", "<|plamo:bos|>"]
 _CTX_PER_SLOT = 768  # the KV cache is shared, so this is an average, not a cap
+_CHAT_CTX_PER_SLOT = 1024  # chat prompts also carry an instruction and a chat template
 _MAX_UNIT_CHARS = 160  # hard upper bound on one request
 _CHUNK_CHARS = 70  # long blocks are split into sentence groups of about this size
 _LABEL_CHARS = 90  # units shorter than this get surrounding text as context
 _CONTEXT_BUDGET = 1500  # total context characters per screen; context costs time
 _SENTENCE_END = re.compile(r"(?<=[。！？!?])(?![。！？!?」』）)\]】])")
+_THINKING = re.compile(r"<think>.*?(?:</think>|$)", re.DOTALL)
+_LABEL_PREFIX = re.compile(r"^(?:english|translation|text to translate|英語|英訳)\s*[:：]\s*", re.IGNORECASE)
+_ERRORS = (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError)
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You translate Japanese text read off a screen (game dialogue, manga, menus, web pages) "
+    "into natural, fluent English. Reply with the English translation only: no explanations, "
+    "notes, romanisation or quotation marks around it. Keep names and numbers. Translate a "
+    "single word or button label as a short label."
+)
 
 
 def build_prompt(text: str, context: str = "") -> str:
@@ -35,16 +48,85 @@ def build_prompt(text: str, context: str = "") -> str:
     return "".join(parts)
 
 
+def chat_messages(text: str, context: str = "", system_prompt: str = "") -> list[dict[str, str]]:
+    """Prompt for a general-purpose chat model."""
+    # Instruction first and the text last: small models otherwise tend to
+    # translate the context instead of the text.
+    if context:
+        request = (
+            "Translate the text into English. Other text from the same screen is given only to "
+            f"help you pick the right meaning: do not translate it.\n\nOther text on the screen:\n"
+            f"{context}\n\nText to translate:\n{text}"
+        )
+    else:
+        request = f"Translate the text into English.\n\nText to translate:\n{text}"
+    return [
+        {"role": "system", "content": system_prompt or DEFAULT_SYSTEM_PROMPT},
+        {"role": "user", "content": request},
+    ]
+
+
+def clean_output(text: str) -> str:
+    """Strip what chat models put around a translation: reasoning, a label."""
+    text = _THINKING.sub("", text).strip()
+    return _LABEL_PREFIX.sub("", text).strip()
+
+
+def api_base(url: str) -> str:
+    """Normalise what a user may paste ("localhost:11434", ".../v1/chat/completions")
+    to the base URL of an OpenAI-compatible API."""
+    url = url.strip().rstrip("/")
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        url = "http://" + url
+    for suffix in ("/chat/completions", "/completions", "/models"):
+        if url.endswith(suffix):
+            url = url[: -len(suffix)]
+    if urlsplit(url).path in ("", "/"):
+        url += "/v1"
+    return url
+
+
+def _headers(api_key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
+def list_models(base_url: str, api_key: str = "", timeout: float = 5.0) -> list[str]:
+    """Model ids an OpenAI-compatible server offers."""
+    r = httpx.get(f"{base_url}/models", headers=_headers(api_key), timeout=timeout)
+    r.raise_for_status()
+    return [m["id"] for m in r.json().get("data", []) if isinstance(m, dict) and "id" in m]
+
+
+def describe_error(exc: BaseException) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        body = " ".join(exc.response.text.split())
+        return f"HTTP {exc.response.status_code} from {exc.request.url}" + (f": {body[:200]}" if body else "")
+    if isinstance(exc, httpx.ConnectError):
+        return f"cannot connect to {exc.request.url}"
+    if isinstance(exc, (KeyError, IndexError, TypeError, ValueError)):
+        return f"unexpected reply ({type(exc).__name__}: {exc})"
+    return str(exc) or type(exc).__name__
+
+
 class LlamaServer:
     """Owns a llama-server child process."""
 
-    def __init__(self, exe: Path, model: Path, port: int = 8765, parallel: int = 8) -> None:
+    def __init__(
+        self,
+        exe: Path,
+        model: Path,
+        port: int = 8765,
+        parallel: int = 8,
+        gpu_layers: int = 999,
+        chat: bool = False,
+    ) -> None:
         self.exe, self.model, self.port, self.parallel = exe, model, port, parallel
+        self.gpu_layers, self.chat = gpu_layers, chat
         self.url = f"http://127.0.0.1:{port}"
         self.proc: subprocess.Popen | None = None
         self.log_path = exe.parent.parent / f"llama-server-{model.stem}.log"
 
-    def start(self, timeout: float = 120.0) -> None:
+    def start(self, timeout: float = 300.0) -> None:
         self.port = _free_port(self.port)
         self.url = f"http://127.0.0.1:{self.port}"
         cmd = [
@@ -52,15 +134,17 @@ class LlamaServer:
             "-m", str(self.model),
             "--host", "127.0.0.1",
             "--port", str(self.port),
-            "-ngl", "999",
+            "-ngl", str(self.gpu_layers),
             "-np", str(self.parallel),
-            "-c", str(self.parallel * _CTX_PER_SLOT),
+            "-c", str(self.parallel * (_CHAT_CTX_PER_SLOT if self.chat else _CTX_PER_SLOT)),
             # One shared KV cache: with per-slot caches llama.cpp cannot batch
             # requests of different lengths together, which halves throughput.
             "--kv-unified",
             "--cache-ram", "0",  # no host-RAM prompt cache; every prompt is new
             "--no-webui",
         ]
+        if self.chat:
+            cmd += ["--reasoning", "off"]  # thinking models: answer straight away
         log = open(self.log_path, "w", encoding="utf-8", errors="replace")
         self.proc = subprocess.Popen(
             cmd,
@@ -140,12 +224,22 @@ def split_sentences(text: str, limit: int = _CHUNK_CHARS) -> list[str]:
 
 @dataclass
 class Backend:
-    """One llama-server. `max_chars` is the largest amount of untranslated
-    Japanese it can handle within the time budget (0 = no limit)."""
+    """One translation server. `max_chars` is the largest amount of
+    untranslated Japanese it can handle within the time budget (0 = no limit).
+
+    `native` means a llama-server we started ourselves: `url` is its root, and
+    PLaMo prompts go to its raw /completion endpoint. Otherwise `url` is the
+    base of an OpenAI-compatible API. `style` is "plamo" or "chat"."""
 
     url: str
     parallel: int
     max_chars: int = 0
+    style: str = "plamo"
+    native: bool = True
+    model: str = ""
+    api_key: str = ""
+    system_prompt: str = ""
+    extra: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -170,6 +264,7 @@ class Translator:
         self.cache: OrderedDict[str, str] = OrderedDict()
         self.cache_size = cache_size
         self._lock = threading.Lock()
+        self.last_error: str | None = None  # from the latest translate() call
 
     def close(self) -> None:
         for pool in self.pools:
@@ -194,31 +289,61 @@ class Translator:
         parts = [self._lookup(chunk) for chunk in split_sentences(text)]
         return None if None in parts else " ".join(parts)
 
+    def _call(self, backend: Backend, text: str, context: str = "") -> str:
+        """One translation request; raises on any failure."""
+        limit = min(400, 48 + len(text) * 3)
+        base = f"{backend.url}/v1" if backend.native else backend.url
+        if backend.style == "chat":
+            url = f"{base}/chat/completions"
+            body: dict = {
+                "messages": chat_messages(text, context, backend.system_prompt),
+                "max_tokens": limit,
+                "temperature": 0,
+            }
+        elif backend.native:
+            url = f"{backend.url}/completion"
+            body = {
+                "prompt": build_prompt(text, context),
+                "n_predict": limit,
+                "temperature": 0,
+                "stop": _STOP,
+                "cache_prompt": False,
+            }
+        else:
+            url = f"{base}/completions"
+            body = {"prompt": build_prompt(text, context), "max_tokens": limit, "temperature": 0, "stop": _STOP}
+        if backend.model:
+            body["model"] = backend.model
+        body.update(backend.extra)
+        r = self.client.post(url, json=body, headers=_headers(backend.api_key))
+        r.raise_for_status()
+        data = r.json()
+        if backend.style == "chat":
+            content = data["choices"][0]["message"]["content"]
+        elif backend.native:
+            content = data["content"]
+        else:
+            content = data["choices"][0]["text"]
+        return clean_output(content or "")
+
     def _request(self, backend: Backend, unit: _Unit) -> None:
         try:
-            r = self.client.post(
-                f"{backend.url}/completion",
-                json={
-                    "prompt": build_prompt(unit.text, unit.context),
-                    "n_predict": min(400, 48 + len(unit.text) * 3),
-                    "temperature": 0,
-                    "stop": _STOP,
-                    "cache_prompt": False,
-                },
-            )
-            r.raise_for_status()
-            unit.result = r.json()["content"].strip()
-        except (httpx.HTTPError, KeyError, ValueError):
+            unit.result = self._call(backend, unit.text, unit.context)
+        except _ERRORS as exc:
             unit.result = ""  # leave this piece untranslated rather than fail the screen
+            self.last_error = describe_error(exc)
             return
         self._remember(unit.text, unit.result)
 
     def warm_up(self) -> None:
         """Run one tiny request through every backend so the first real
-        translation does not pay for lazy initialisation."""
+        translation does not pay for lazy initialisation, and so a backend
+        that does not work is reported now rather than as missing text."""
         for backend in self.backends:
-            self._request(backend, _Unit(0, "準備完了"))
-        self.cache.clear()
+            try:
+                self._call(backend, "準備完了")
+            except _ERRORS as exc:
+                raise RuntimeError(f"the translation model does not answer: {describe_error(exc)}") from exc
 
     def pick_backend(self, pending_chars: int) -> int:
         for i, backend in enumerate(self.backends):
@@ -228,6 +353,7 @@ class Translator:
 
     def translate(self, texts: list[str], use_context: bool = True) -> list[str]:
         """Translate `texts`, the blocks of one screen in reading order."""
+        self.last_error = None
         units = [_Unit(i, chunk) for i, text in enumerate(texts) for chunk in split_sentences(text)]
         pending = []
         for unit in units:

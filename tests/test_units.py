@@ -122,6 +122,72 @@ def test_parse_hotkey_rejects_nonsense():
         win32.parse_hotkey("ctrl+banana")
 
 
+def _bgr(image) -> np.ndarray:
+    from PySide6.QtGui import QImage
+
+    image = image.convertToFormat(QImage.Format.Format_RGB32)
+    return np.frombuffer(image.constBits(), np.uint8).reshape(image.height(), image.width(), 4)[:, :, :3].copy()
+
+
+def test_patterned_backgrounds_are_rebuilt():
+    """Text on hatching / screentone / stripes is erased by copying the
+    pattern, in phase, from next to it."""
+    import sys
+    from pathlib import Path
+
+    from PySide6.QtGui import QGuiApplication
+
+    from jpreplace.render import make_patch
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    import make_samples
+
+    app = QGuiApplication.instance() or QGuiApplication(["test", "-platform", "offscreen"])
+    assert app is not None
+    page, clean = _bgr(make_samples.hatched()), _bgr(make_samples.hatched(with_text=False))
+    gray = page.mean(axis=2).astype(np.float32)
+    for i, (kind, text, outlined) in enumerate(make_samples.HATCHED):
+        x, y = 30 + (i % 2) * 485, 30 + (i // 2) * 345
+        panel = np.abs(page[y : y + 315, x : x + 455].astype(int) - clean[y : y + 315, x : x + 455]).max(axis=2)
+        ys, xs = np.nonzero(panel > 20)
+        block = group_lines([line(x + xs.min() - 3, y + ys.min() - 3, x + xs.max() + 4, y + ys.max() + 4, text)])[0]
+        patch = make_patch(page, block, gray, [])
+        h, w = patch.mask.shape
+        error = np.abs(patch.pixels.astype(int) - clean[patch.y : patch.y + h, patch.x : patch.x + w]).mean()
+        assert error < 4, f"{kind}: background rebuilt with error {error:.1f}"
+        if outlined:
+            assert patch.outline == (255, 255, 255) and max(patch.text_color) < 80, kind
+
+
+def test_same_layout_ignores_symbol_flicker():
+    from jpreplace.pipeline import same_layout
+
+    a = group_lines([line(50, 100, 400, 122, "また明日ね。")])
+    b = group_lines([line(51, 101, 401, 122, "また明日ね。▼")])
+    c = group_lines([line(50, 100, 400, 122, "また明後日ね。")])
+    assert same_layout(a, b)
+    assert not same_layout(a, c)
+
+
+def test_api_base_normalisation():
+    from jpreplace.translate import api_base
+
+    assert api_base("localhost:11434") == "http://localhost:11434/v1"
+    assert api_base("http://127.0.0.1:1234/v1/") == "http://127.0.0.1:1234/v1"
+    assert api_base("https://api.example.com/v1/chat/completions") == "https://api.example.com/v1"
+    assert api_base("https://example.com/api/openai") == "https://example.com/api/openai"
+
+
+def test_chat_output_cleanup():
+    from jpreplace.translate import chat_messages, clean_output
+
+    assert clean_output("<think>hmm</think>\nSave settings") == "Save settings"
+    assert clean_output("Translation: Load") == "Load"
+    assert clean_output("<think>never closed") == ""
+    user = chat_messages("ロード", "セーブ")[1]["content"]
+    assert user.endswith("ロード") and "セーブ" in user
+
+
 def test_unpunctuated_text_is_still_bounded():
     text = "あ" * 100 + "、" + "い" * 300
     chunks = split_sentences(text)

@@ -86,10 +86,11 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     settings = config.Settings.load()
 
-    ensure_llama()
+    if args.translator or settings.translator != "server":
+        ensure_llama()
     for name in args.ocr or [settings.ocr]:
         ensure_ocr(name)
-    for name in args.translator or [settings.translator]:
+    for name in args.translator or settings.builtin_translators():
         ensure_translator(name)
     print("All assets ready.")
     return 0

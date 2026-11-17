@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QLinearGradient, QPainter
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QLinearGradient, QPainter, QPainterPath, QPen
 
 ARTICLE = [
     ("見出し", "東京の地下鉄、深夜運行の実証実験を開始へ"),
@@ -132,7 +132,66 @@ def manga(w: int = 900, h: int = 700) -> QImage:
     return img
 
 
-SAMPLES = {"webpage": webpage, "game": game, "manga": manga}
+HATCHED = [
+    ("diagonal", "ここから先は危険だ。", False),
+    ("dots", "静かな夜だった。", True),
+    ("cross", "誰もいないはずの部屋", False),
+    ("stripes", "本日のおすすめ商品", False),
+]
+
+
+def _pattern(p: QPainter, kind: str, rect: QRectF) -> None:
+    p.save()
+    p.setClipRect(rect)
+    p.fillRect(rect, QColor("#ffffff") if kind != "stripes" else QColor("#fdf3d8"))
+    p.setPen(QPen(QColor("#202020"), 1.6))
+    x0, y0, x1, y1 = rect.left(), rect.top(), rect.right(), rect.bottom()
+    if kind in ("diagonal", "cross"):
+        span = rect.width() + rect.height()
+        for d in range(0, int(span), 7):
+            p.drawLine(QPointF(x0 + d, y0), QPointF(x0 + d - rect.height(), y1))
+            if kind == "cross":
+                p.drawLine(QPointF(x0 + d - rect.height(), y0), QPointF(x0 + d, y1))
+    elif kind == "dots":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#303030"))
+        for row, y in enumerate(range(int(y0), int(y1) + 8, 8)):
+            for x in range(int(x0) + (row % 2) * 4, int(x1) + 8, 8):
+                p.drawEllipse(QPointF(x, y), 1.8, 1.8)
+    else:
+        for y in range(int(y0), int(y1), 12):
+            p.fillRect(QRectF(x0, y, rect.width(), 6), QColor("#f3dfae"))
+    p.restore()
+
+
+def hatched(w: int = 1000, h: int = 720, with_text: bool = True) -> QImage:
+    """Text on manga screentone and other repeating patterns."""
+    img = QImage(w, h, QImage.Format.Format_RGB32)
+    img.fill(QColor("#ffffff"))
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    font = _font("Yu Gothic", 30, True)
+    for i, (kind, text, outlined) in enumerate(HATCHED):
+        rect = QRectF(30 + (i % 2) * 485, 30 + (i // 2) * 345, 455, 315)
+        _pattern(p, kind, rect)
+        p.setPen(QPen(QColor("#000000"), 2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(rect)
+        if not with_text:
+            continue
+        path = QPainterPath()
+        path.addText(QPointF(rect.left() + 50, rect.top() + 150), font, text)
+        if outlined:
+            outline = QPen(QColor("#ffffff"), 7)
+            outline.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.strokePath(path, outline)
+        p.fillPath(path, QColor("#111111"))
+    p.end()
+    return img
+
+
+SAMPLES = {"webpage": webpage, "game": game, "manga": manga, "hatched": hatched}
 
 
 def main() -> None:

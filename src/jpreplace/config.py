@@ -62,20 +62,38 @@ def ocr_dir(repo: str) -> Path:
 
 @dataclass
 class Settings:
-    # "plamo-8b" (best quality), "plamo-2b" (fastest, least VRAM) or "auto" (both
-    # loaded; the 2B takes over when a screen has too much text for the 8B).
+    # "plamo-8b" (best quality), "plamo-2b" (fastest, least VRAM), "auto" (both
+    # loaded; the 2B takes over when a screen has too much text for the 8B),
+    # "file" (any GGUF model, see model_file) or "server" (an LLM server you
+    # run yourself or a hosted API, see server_url).
     translator: str = "auto"
     quality_max_chars: int = 1200  # auto: more untranslated characters than this -> 2B
+    # translator "file": a .gguf model run with the bundled llama.cpp.
+    model_file: str = ""
+    gpu_layers: int = 999  # layers offloaded to the GPU; lower it if the model does not fit
+    # translator "server": base URL of an OpenAI-compatible API, e.g.
+    # http://127.0.0.1:11434/v1 (Ollama) or http://127.0.0.1:1234/v1 (LM Studio).
+    server_url: str = ""
+    server_model: str = ""  # "" = the first model the server lists
+    server_api_key: str = ""
+    server_extra: dict = field(default_factory=dict)  # extra JSON fields sent with every request
+    # "plamo" (PLaMo Translate's native prompt), "chat" (an instruction for a
+    # general chat model) or "auto" (plamo if the model's name says PLaMo).
+    prompt_style: str = "auto"
+    system_prompt: str = ""  # chat style; "" = the built-in instruction
     ocr: str = "medium"
     llama_port: int = 8765
     parallel: int = 16
     hotkey_translate: str = "ctrl+alt+t"
     hotkey_clear: str = "ctrl+alt+c"
     hotkey_live: str = "ctrl+alt+l"
+    hotkey_fullscreen: str = "ctrl+alt+f"
     live: bool = False
     live_interval_ms: int = 400
     font_family: str = "Segoe UI"
     ocr_scale: float = 1.0  # 2.0 helps with very small text, at some speed cost
+    # "auto" (DXGI desktop duplication, falling back to GDI), "dxgi" or "gdi".
+    capture: str = "auto"
     geometry: list[int] = field(default_factory=lambda: [200, 200, 900, 600])
 
     @classmethod
@@ -89,3 +107,14 @@ class Settings:
 
     def save(self) -> None:
         SETTINGS_PATH.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+
+    def builtin_translators(self) -> list[str]:
+        """The bundled PLaMo models this configuration needs."""
+        if self.translator == "auto":
+            return ["plamo-8b", "plamo-2b"]
+        return [self.translator] if self.translator in TRANSLATORS else []
+
+    def resolved_prompt_style(self, model_name: str) -> str:
+        if self.prompt_style in ("plamo", "chat"):
+            return self.prompt_style
+        return "plamo" if "plamo" in model_name.lower() else "chat"
