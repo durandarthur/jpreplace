@@ -4,6 +4,17 @@ A Google Lens-style overlay for Windows. Put the frame over anything on screen
 that contains Japanese; the text is erased and re-drawn in English, in place.
 Everything runs locally on your GPU.
 
+![The jpreplace frame over a Japanese web page: the article inside the frame is in English, the menu and buttons outside it are still in Japanese](docs/images/frame.png)
+
+| Original | With jpreplace |
+| --- | --- |
+| ![Game dialogue box in Japanese](docs/images/game-before.png) | ![The same dialogue box in English](docs/images/game-after.png) |
+| ![Manga speech bubbles in Japanese](docs/images/manga-before.png) | ![The same bubbles in English](docs/images/manga-after.png) |
+| ![Japanese text on hatched and dotted screentone](docs/images/patterns-before.png) | ![English text on the rebuilt patterns](docs/images/patterns-after.png) |
+
+<sub>Test screens from `tests/make_samples.py`, translated by the real
+pipeline with the default models (`uv run python scripts/readme_images.py`).</sub>
+
 - **OCR**: PP-OCRv6 (detection + recognition) on ONNX Runtime / CUDA.
 - **Translation**: [PLaMo 3 Translate](https://huggingface.co/pfnet/plamo-3-translate-8b-GGUF)
   (a dedicated JA↔EN translation LLM) served by llama.cpp, or
@@ -172,4 +183,5 @@ uv run pytest                                   # unit tests (no GPU needed)
 uv run python tests/make_samples.py             # synthetic test screens -> out/samples
 uv run python scripts/translate_image.py out/samples/webpage.png
 uv run python scripts/bench_translate.py out/samples/webpage.png --show
+uv run python scripts/readme_images.py          # the pictures above -> docs/images
 ```
